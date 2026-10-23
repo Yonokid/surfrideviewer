@@ -1,0 +1,15 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Unpacked .rfz fonts (regenerated on first server start; derived from game data)
+.cache/
+
+# Temp file from an interrupted patch save
+*.json.tmp
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

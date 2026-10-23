@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SRD Viewer</title>
+<style>
+  :root { --bg: #1b1d22; --panel: #24272e; --line: #353943; --fg: #d8dbe2; --dim: #8a909c; --acc: #5fb3ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: grid; grid-template-columns: 280px 1fr 300px; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+  aside:last-child { border-right: 0; border-left: 1px solid var(--line); }
+  h3 { margin: 8px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+  input, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit; }
+  button { cursor: pointer; }
+  #files { flex: 1; min-height: 120px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
+  #files div, #tree div { padding: 2px 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #files div:hover, #tree div:hover { background: var(--line); }
+  #files div.patched::after { content: ' ✎'; color: var(--dim); }
+  #files div.sel, #tree div.sel { background: var(--acc); color: #000; }
+  #layers label { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  #stage { flex: 1; display: grid; place-items: center; overflow: hidden; min-height: 0; }
+  canvas { background: repeating-conic-gradient(#2a2d34 0 25%, #22252b 0 50%) 0 0 / 32px 32px; box-shadow: 0 0 0 1px var(--line); }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px; border-top: 1px solid var(--line); background: var(--panel); }
+  #bar input[type=range] { flex: 1; }
+  #status { color: var(--dim); padding: 0 8px 6px; background: var(--panel); min-height: 1.4em; }
+  #editor { display: grid; grid-template-columns: auto 1fr; gap: 4px 6px; align-items: center; }
+  #editor input, #editor textarea { width: 100%; min-width: 0; }
+  #editor textarea { min-height: 4.5em; resize: vertical; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+  #editor .changed { border-color: var(--acc); }
+  #editor .note { grid-column: 1 / -1; color: var(--dim); font-size: 11px; }
+  #info { white-space: pre-wrap; font: 11px ui-monospace, monospace; color: var(--dim); }
+  .tag { color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<aside>
+  <h3>Files</h3>
+  <input id="filter" placeholder="Filter…">
+  <div id="files"></div>
+  <h3>Patch</h3>
+  <div style="display:flex; gap:6px; align-items:center">
+    <button id="importPatch" disabled>Import…</button>
+    <button id="exportPatch" disabled>Export</button>
+    <button id="clearPatch" disabled>Remove</button>
+    <input type="file" id="patchFile" accept=".json,application/json" hidden>
+  </div>
+  <label title="Applied in memory; .srd files are never modified"><input type="checkbox" id="patch" checked disabled> Apply <span class="tag" id="patchinfo"></span></label>
+  <label id="tltexRow" hidden title="Use the translation's src/texture/*.dds instead of the game's"><input type="checkbox" id="tltex" checked> Translated textures</label>
+  <h3>Scene</h3>
+  <select id="scene"></select>
+  <h3>Layers</h3>
+  <div id="layers"></div>
+  <h3>Animation</h3>
+  <select id="anim"></select>
+  <label><input type="checkbox" id="showbg"> Scene background colour</label>
+  <label><input type="checkbox" id="showbox"> Show bounding boxes</label>
+</aside>
+<main>
+  <div id="stage"><canvas id="cv" width="1920" height="1080"></canvas></div>
+  <div id="bar">
+    <button id="play">⏸</button>
+    <input type="range" id="frame" min="0" max="0" value="0">
+    <span id="flabel">0 / 0</span>
+  </div>
+  <div id="status"></div>
+</main>
+<aside>
+  <h3>Nodes</h3>
+  <div id="tree"></div>
+  <h3>Selected</h3>
+  <div id="editor"></div>
+  <div id="info"></div>
+</aside>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+let proj = null, scene = null, visible = new Set(), animName = '', frame = 0, playing = true, selNode = null;
+const images = {};  // texKey(name) -> HTMLImageElement
+const fonts = {};   // .rfz name -> null while unpacking, then {ascent, descent, margin, glyphs, pages}
+const tmp = document.createElement('canvas'), tctx = tmp.getContext('2d');
+
+// ---------- loading ----------
+let renderFiles = () => {};
+const patches = new Map();  // .srd path -> {name, list, dirty}: imported/loaded patches incl. unsaved edits
+// --translation info from the server: patched = files with a patch JSON on disk
+let server = { translation: false, textures: false, patched: new Set() };
+let current = null;
+const useTlTex = () => server.textures && $('tltex').checked;
+const texKey = name => (useTlTex() ? 'tl:' : '') + name;
+function loadImages() {
+  for (const t of proj.textures) if (!images[texKey(t.name)]) {
+    const img = new Image();
+    img.src = '/api/tex?name=' + encodeURIComponent(t.name) + (useTlTex() ? '&tl=1' : '');
+    img.onerror = () => { $('status').textContent = 'Missing texture: ' + t.name; };
+    images[texKey(t.name)] = img;
+  }
+}
+$('tltex').onchange = () => proj && loadImages();
+fetch('/api/list').then(r => r.json()).then(({ files, patched, translation, textures }) => {
+  server = { translation, textures, patched: new Set(patched) };
+  $('tltexRow').hidden = !textures;
+  if (translation) { $('exportPatch').textContent = 'Save'; $('clearPatch').textContent = 'Revert'; }
+  const render = () => {
+    const f = $('filter').value.toLowerCase();
+    $('files').replaceChildren(...files.filter(x => x.toLowerCase().includes(f)).map(x => {
+      const d = document.createElement('div');
+      d.textContent = x.split('/').pop(); d.title = x;
+      d.classList.toggle('patched', patches.has(x) || server.patched.has(x)); d.classList.toggle('sel', x === current);
+      d.onclick = () => { document.querySelectorAll('#files .sel').forEach(e => e.classList.remove('sel')); d.classList.add('sel'); load(x); };
+      return d;
+    }));
+  };
+  $('filter').oninput = render; render();
+  renderFiles = render;
+  if (location.hash.length > 1) load(decodeURIComponent(location.hash.slice(1)));
+});
+
+async function load(path, keepView = false) {
+  $('status').textContent = 'Loading ' + path + '…';
+  if (server.patched.has(path) && !patches.has(path)) {  // --translation: load its patch once, then edit in memory
+    const r = await fetch('/api/patch?f=' + encodeURIComponent(path));
+    if (r.ok) patches.set(path, { name: path.split('/').pop().replace(/\.srd$/, '.json'), list: await r.json() });
+  }
+  const patch = patches.get(path), usePatch = patch && $('patch').checked;
+  const r = await fetch('/api/srd?f=' + encodeURIComponent(path),
+    usePatch ? { method: 'POST', body: JSON.stringify(patch.list) } : undefined);
+  if (!r.ok) { $('status').textContent = await r.text(); return; }
+  const view = keepView && { scene: +$('scene').value, visible, animName, frame, sel: selRef() };
+  proj = await r.json();
+  current = path;
+  history.replaceState(null, '', '#' + encodeURIComponent(path));
+  loadImages();
+  proj.fonts.forEach(loadFont);
+  $('scene').replaceChildren(...proj.scenes.map((s, i) => new Option(`${s.name} (${s.layers.length})`, i)));
+  pickScene(view ? view.scene : 0);
+  if (view) {  // patch toggled: keep the same view
+    $('scene').value = view.scene;
+    visible = view.visible;
+    $('layers').querySelectorAll('input').forEach((cb, li) => cb.checked = visible.has(li));
+    animName = view.animName; refreshAnims(); buildTree(); setFrame(view.frame);
+  }
+  select(view?.sel && scene.layers[view.sel[0]]?.nodes[view.sel[1]]);
+  const p = proj.patch;
+  lastFailed = p?.failed.length ?? 0;
+  updatePatchUI();
+  if (p?.failed.length) {
+    $('info').textContent = 'Failed patches:\n' + p.failed.map(f => `${f.path}\n  ${f.error}\n  wanted: ${JSON.stringify(f.original)}`).join('\n');
+    console.warn('failed patches', p.failed);
+  }
+  $('status').textContent = `${proj.name}: ${proj.scenes.length} scenes, ${proj.textures.length} textures`;
+}
+$('patch').onchange = () => current && load(current, true);
+$('importPatch').onclick = () => $('patchFile').click();
+$('patchFile').onchange = async e => {
+  const file = e.target.files[0]; e.target.value = '';
+  if (!file || !current) return;
+  if (patches.get(current)?.dirty && !confirm(`Replace unsaved edits with ${file.name}?`)) return;
+  try {
+    const list = JSON.parse(await file.text());
+    if (!Array.isArray(list)) throw new Error('expected a JSON list of {path, value, original}');
+    patches.set(current, { name: file.name, list });
+  } catch (err) { $('status').textContent = `Can't import ${file.name}: ${err.message}`; return; }
+  $('patch').checked = true; renderFiles(); load(current, true);
+};
+// Remove (or Revert with --translation: drop in-memory changes; load() then re-reads the patch on disk)
+$('clearPatch').onclick = () => {
+  const patch = patches.get(current);
+  if (patch?.dirty && !confirm(`Discard unsaved edits in ${patch.name}?`)) return;
+  patches.delete(current); renderFiles(); load(current, true);
+};
+// Export: download; Save with --translation: write src/srd/<path>.json on the server
+$('exportPatch').onclick = async () => {
+  const patch = patches.get(current);
+  if (server.translation) {
+    const r = await fetch('/api/patch?f=' + encodeURIComponent(current), { method: 'PUT', body: JSON.stringify(patch.list) });
+    if (!r.ok) { $('status').textContent = `Save failed: ${await r.text()}`; return; }
+    server.patched.add(current);
+    $('status').textContent = `Saved ${patch.name} (${patch.list.length} entries)`;
+  } else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(patch.list, null, 2)], { type: 'application/json' }));
+    a.download = patch.name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  patch.dirty = false;
+  renderFiles(); updatePatchUI();
+};
+addEventListener('beforeunload', e => { if ([...patches.values()].some(p => p.dirty)) e.preventDefault(); });
+
+let lastFailed = 0;
+function updatePatchUI() {
+  const patch = patches.get(current), on = patch && $('patch').checked;
+  $('importPatch').disabled = !current;
+  $('clearPatch').disabled = $('exportPatch').disabled = $('patch').disabled = !patch;
+  $('patchinfo').textContent = !patch ? '' : `${patch.name}: ${patch.list.length} entries`
+    + (!on ? ' (off)' : lastFailed ? `, ${lastFailed} failed` : '') + (patch.dirty ? ' • unsaved' : '');
+}
+
+// ---------- editing ----------
+// Editable values; node.edit[key] holds the JSONPath the server found for each one.
+const FIELDS = {
+  x: { label: 'X', get: n => n.pos[0], set: (n, v) => n.pos[0] = v },
+  y: { label: 'Y', get: n => n.pos[1], set: (n, v) => n.pos[1] = v },
+  w: { label: 'Width', get: n => n.data.w, set: (n, v) => n.data.w = v },
+  h: { label: 'Height', get: n => n.data.h, set: (n, v) => n.data.h = v },
+  text: { label: 'Text', get: n => n.data.text.str, set: (n, v) => n.data.text.str = v },
+};
+const TRACK_OF = { x: 0, y: 1, w: 11, h: 12 };
+
+function selRef() {
+  const li = scene?.layers.findIndex(l => l.nodes.includes(selNode));
+  return li >= 0 ? [li, scene.layers[li].nodes.indexOf(selNode)] : null;
+}
+
+// Record an edit as a patch entry (original = the game's value), and apply it to the model for instant preview.
+function edit(n, key, value) {
+  let patch = patches.get(current);
+  if (!patch) patches.set(current, patch = { name: current.split('/').pop().replace(/\.srd$/, '.json'), list: [] });
+  const path = n.edit[key], i = patch.list.findIndex(e => e.path === path);
+  const original = i >= 0 ? patch.list[i].original : FIELDS[key].get(n);
+  if (value === original) { if (i >= 0) patch.list.splice(i, 1); }
+  else if (i >= 0) patch.list[i].value = value;
+  else patch.list.push({ path, value, original });
+  FIELDS[key].set(n, value);
+  patch.dirty = true;
+  renderFiles(); updatePatchUI();
+  return value !== original;
+}
+
+function select(n) {
+  selNode = n || null;
+  document.querySelectorAll('#tree .sel').forEach(e => e.classList.remove('sel'));
+  if (n) $('tree').querySelector(`[data-sel="${selRef().join(':')}"]`)?.classList.add('sel');
+  const ed = $('editor');
+  ed.replaceChildren();
+  $('info').textContent = n ? JSON.stringify({ ...n, flags: '0x' + n.flags.toString(16) }, null, 1) : '';
+  if (!n) return;
+  const patch = patches.get(current), locked = patch && !$('patch').checked;
+  const keys = Object.keys(FIELDS).filter(k => n.edit?.[k]);
+  if (!keys.length) { ed.append(note('Nothing editable on this node.')); return; }
+  if (locked) ed.append(note('Turn Apply on to edit.'));
+  for (const k of keys) {
+    const f = FIELDS[k], entry = patch?.list.find(e => e.path === n.edit[k]);
+    const input = document.createElement(k === 'text' ? 'textarea' : 'input');
+    if (k === 'text') input.value = f.get(n).replace(/\r\n/g, '\n');
+    else { input.type = 'number'; input.step = 1; input.value = +f.get(n).toFixed(3); }
+    input.disabled = locked;
+    input.classList.toggle('changed', !!entry);
+    input.title = entry ? `original: ${JSON.stringify(entry.original)}` : '';
+    input.oninput = () => {
+      let v;
+      if (k === 'text') {  // the game uses \r\n line breaks
+        const orig = entry?.original ?? f.get(n);
+        v = /\r\n/.test(orig) ? input.value.replace(/\r?\n/g, '\r\n') : input.value;
+      } else {
+        if (input.value === '' || isNaN(+input.value)) return;
+        v = +input.value;
+      }
+      input.classList.toggle('changed', edit(n, k, v));
+    };
+    const lab = document.createElement('label'); lab.textContent = f.label;
+    ed.append(lab, input);
+  }
+  const li = scene.layers.findIndex(l => l.nodes.includes(n)), ci = scene.layers[li].nodes.indexOf(n);
+  const anim = scene.layers[li].anims.find(a => a.name === animName);
+  const animated = keys.filter(k => anim?.motions.some(m => m.cast === ci && m.tracks.some(t => t.type === TRACK_OF[k])));
+  if (animated.length) ed.append(note(`${animated.map(k => FIELDS[k].label).join(', ')} animated by ${animName}; pick (none) to see the base value.`));
+}
+const note = t => Object.assign(document.createElement('div'), { className: 'note', textContent: t });
+
+function loadFont(name) {
+  if (name in fonts) return;
+  fonts[name] = null;
+  const q = '/api/font?name=' + encodeURIComponent(name);
+  fetch(q).then(r => r.ok ? r.json() : Promise.reject(r.status)).then(f => {
+    const n = 1 + Math.max(0, ...Object.values(f.glyphs).map(g => g[1]).filter(p => p !== 65535));
+    f.pages = [...Array(n)].map((_, i) => Object.assign(new Image(), { src: `${q}&page=${i}` }));
+    fonts[name] = f;
+  }).catch(e => { $('status').textContent = `Font ${name} unavailable (${e}), using system font`; });
+}
+
+function pickScene(i) {
+  scene = proj.scenes[i];
+  cv.width = scene.w; cv.height = scene.h; fit();
+  visible = new Set(scene.layers.length ? [0] : []);
+  $('layers').replaceChildren(...scene.layers.map((l, li) => {
+    const lab = document.createElement('label');
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = visible.has(li);
+    cb.onchange = () => { cb.checked ? visible.add(li) : visible.delete(li); refreshAnims(); buildTree(); };
+    lab.append(cb, ' ' + l.name + ' ');
+    const s = document.createElement('span'); s.className = 'tag'; s.textContent = l.nodes.length; lab.append(s);
+    return lab;
+  }));
+  refreshAnims(); buildTree();
+}
+$('scene').onchange = e => pickScene(+e.target.value);
+
+function refreshAnims() {
+  const names = new Set();
+  for (const li of visible) for (const a of scene.layers[li].anims) names.add(a.name);
+  const opts = [new Option('(none)', ''), ...[...names].map(n => new Option(n, n))];
+  $('anim').replaceChildren(...opts);
+  if (!names.has(animName)) {  // default to the first animation that actually moves something
+    const all = [...visible].flatMap(li => scene.layers[li].anims);
+    animName = (all.find(a => a.motions.length) || all[0])?.name || '';
+  }
+  $('anim').value = animName;
+  setFrame(0);
+}
+$('anim').onchange = e => { animName = e.target.value; setFrame(0); };
+
+function maxEnd() {
+  let m = 0;
+  for (const li of visible) for (const a of scene.layers[li].anims) if (a.name === animName) m = Math.max(m, a.end);
+  return m;
+}
+function setFrame(f) {
+  const end = maxEnd();
+  frame = end > 0 ? f % (end + 1) : 0;
+  $('frame').max = end; $('frame').value = Math.floor(frame);
+  $('flabel').textContent = `${Math.floor(frame)} / ${end}`;
+}
+$('frame').oninput = e => { playing = false; $('play').textContent = '▶'; setFrame(+e.target.value); };
+$('play').onclick = () => { playing = !playing; $('play').textContent = playing ? '⏸' : '▶'; };
+
+function fit() {
+  const st = $('stage'), k = Math.min(st.clientWidth / cv.width, st.clientHeight / cv.height, 1);
+  cv.style.width = cv.width * k + 'px'; cv.style.height = cv.height * k + 'px';
+}
+addEventListener('resize', fit);
+
+// ---------- node tree panel ----------
+function roots(nodes) {
+  const reached = new Set();
+  nodes.forEach(n => { if (n.child >= 0) reached.add(n.child); if (n.sibling >= 0) reached.add(n.sibling); });
+  return nodes.map((_, i) => i).filter(i => !reached.has(i));
+}
+function walk(nodes, start, depth, fn) {  // visit node, its children, then its siblings
+  for (let i = start; i >= 0 && i < nodes.length; i = nodes[i].sibling) {
+    fn(i, depth);
+    if (nodes[i].child >= 0) walk(nodes, nodes[i].child, depth + 1, fn);
+  }
+}
+const BLEND = { 1: 'lighter', 2: 'difference', 3: 'multiply' };
+const KIND = { 0: '', 1: 'img', 2: 'slice', 3: 'ref', 4: 'num' };
+function buildTree() {
+  const out = [];
+  for (const li of visible) {
+    const l = scene.layers[li];
+    const h = document.createElement('div'); h.textContent = '▣ ' + l.name; h.style.color = 'var(--acc)'; out.push(h);
+    for (const r of roots(l.nodes)) walk(l.nodes, r, 1, (i, d) => {
+      const n = l.nodes[i], el = document.createElement('div');
+      el.style.paddingLeft = d * 12 + 'px';
+      el.textContent = n.name + (KIND[n.flags & 15] ? '  [' + KIND[n.flags & 15] + ']' : '');
+      el.dataset.sel = `${li}:${i}`;
+      el.onclick = () => select(n);
+      out.push(el);
+    });
+  }
+  $('tree').replaceChildren(...out);
+}
+
+// ---------- animation ----------
+function evalTrack(keys, f) {
+  if (!keys.length) return undefined;
+  if (f <= keys[0][0]) return keys[0][1];
+  for (let i = 0; i < keys.length - 1; i++) {
+    const [f0, v0, interp, , out0] = keys[i], [f1, v1, , in1] = keys[i + 1];
+    if (f >= f1) continue;
+    if (interp === 0 || typeof v0 === 'boolean') return v0;
+    const h = f1 - f0, s = (f - f0) / h;
+    if (typeof v0 === 'string') return lerpColor(v0, v1, s);
+    if (interp === 2) {  // hermite, tangents are slopes per frame
+      const s2 = s * s, s3 = s2 * s;
+      return (2 * s3 - 3 * s2 + 1) * v0 + (s3 - 2 * s2 + s) * h * out0 + (-2 * s3 + 3 * s2) * v1 + (s3 - s2) * h * in1;
+    }
+    return v0 + (v1 - v0) * s;
+  }
+  return keys[keys.length - 1][1];
+}
+
+const parseColor = c => [1, 3, 5, 7].map(i => parseInt(c.substr(i, 2), 16) / 255);  // #RRGGBBAA -> [r,g,b,a]
+const lerpColor = (a, b, s) => {
+  const A = parseColor(a), B = parseColor(b);
+  return '#' + A.map((v, i) => Math.round((v + (B[i] - v) * s) * 255).toString(16).padStart(2, '0')).join('').toUpperCase();
+};
+const mul = (a, b) => a.map((v, i) => v * b[i]);
+
+// Apply animated tracks of the layer's current animation to a copy of each node's state.
+function nodeStates(layer, name, f) {
+  const st = layer.nodes.map(n => ({
+    x: n.pos[0], y: n.pos[1], z: n.pos[2], rx: n.rot[0], ry: n.rot[1], rot: n.rot[2],
+    sx: n.scale[0], sy: n.scale[1], sz: n.scale[2], display: n.display,
+    color: parseColor(n.color), w: n.data?.w, h: n.data?.h, vcol: n.data?.vcol?.[0] ? parseColor(n.data.vcol[0]) : [1, 1, 1, 1],
+    crop: 0, value: n.data?.value,
+  }));
+  const anim = layer.anims.find(a => a.name === name);
+  if (!anim) return st;
+  for (const m of anim.motions) {
+    const s = st[m.cast]; if (!s) continue;
+    for (const t of m.tracks) {
+      const v = evalTrack(t.keys, f); if (v === undefined) continue;
+      switch (t.type) {
+        case 0: s.x = v; break;
+        case 1: s.y = v; break;
+        case 2: s.z = v; break;
+        case 3: s.rx = v; break;
+        case 4: s.ry = v; break;
+        case 5: s.rot = v; break;
+        case 6: s.sx = v; break;
+        case 7: s.sy = v; break;
+        case 8: s.sz = v; break;
+        case 9: s.color = parseColor(v); break;
+        case 10: s.display = !!v; break;
+        case 11: s.w = v; break;
+        case 12: s.h = v; break;
+        case 13: s.vcol = parseColor(v); break;  // ponytail: only top-left vertex colour, no per-vertex gradients
+        case 17: s.crop = v; break;
+        case 21: s.color[3] = v; break;  // material alpha
+        case 23: s.value = v; break;     // number value (guessed)
+      }
+    }
+  }
+  return st;
+}
+
+// ---------- drawing ----------
+function cropOf(cref) {
+  if (!cref) return null;
+  const tex = proj.textures[cref[0]], img = tex && images[texKey(tex.name)];
+  const c = tex?.crops[cref[1]];
+  if (!img?.complete || !img.naturalWidth || !c) return null;
+  const kx = img.naturalWidth / tex.w, ky = img.naturalHeight / tex.h;
+  return { img, sx: c[0] * kx, sy: c[1] * ky, sw: (c[2] - c[0]) * kx, sh: (c[3] - c[1]) * ky, w: c[2] - c[0], h: c[3] - c[1] };
+}
+
+// Draw a crop tinted by colour [r,g,b,a]. Canvas 2D can't multiply natively, so tint via an offscreen canvas.
+// flags (CIMG 0x49 / SLIC 0x83): 0x10 = flip X, 0x20 = flip Y.
+function drawCrop(cr, dx, dy, dw, dh, col, flags = 0) {
+  if (!cr || dw === 0 || dh === 0) return;
+  if (flags & 0x30) {
+    ctx.save();
+    ctx.translate(dx + (flags & 0x10 ? dw : 0), dy + (flags & 0x20 ? dh : 0));
+    ctx.scale(flags & 0x10 ? -1 : 1, flags & 0x20 ? -1 : 1);
+    drawCrop(cr, 0, 0, dw, dh, col);
+    ctx.restore();
+    return;
+  }
+  ctx.globalAlpha = Math.max(0, Math.min(1, col[3]));
+  if (col[0] > 0.99 && col[1] > 0.99 && col[2] > 0.99) {
+    ctx.drawImage(cr.img, cr.sx, cr.sy, cr.sw, cr.sh, dx, dy, dw, dh);
+    return;
+  }
+  const w = Math.max(1, Math.ceil(cr.sw)), h = Math.max(1, Math.ceil(cr.sh));
+  tmp.width = w; tmp.height = h;
+  tctx.globalCompositeOperation = 'source-over';
+  tctx.drawImage(cr.img, cr.sx, cr.sy, cr.sw, cr.sh, 0, 0, w, h);
+  tctx.globalCompositeOperation = 'multiply';
+  tctx.fillStyle = `rgb(${col[0] * 255},${col[1] * 255},${col[2] * 255})`;
+  tctx.fillRect(0, 0, w, h);
+  tctx.globalCompositeOperation = 'destination-in';
+  tctx.drawImage(cr.img, cr.sx, cr.sy, cr.sw, cr.sh, 0, 0, w, h);
+  ctx.drawImage(tmp, 0, 0, w, h, dx, dy, dw, dh);
+}
+
+// glyph = [advance, page, origin_x, origin_y, x1, y1, x2, y2]; atlas glyphs are white, tinted via source-in.
+// Rendered strings are cached per font/text/align/colour; laying out glyphs every frame is too slow.
+function drawBitmapText(font, lines, tx, ty, align, ksx, ksy, col) {
+  const pad = font.ascent, colour = rgba([...col.slice(0, 3), 1]), key = [lines.join('\n'), align, colour].join('\0');
+  font.cache ??= new Map();
+  let c = font.cache.get(key);
+  if (!c) {
+    if (font.cache.size > 500) font.cache.clear();  // ponytail: crude bound (animated colours), LRU if it ever matters
+    font.cache.set(key, c = renderText(font, lines, align, colour));
+  }
+  const ax = align === 'center' ? c.maxW / 2 : align === 'right' ? c.maxW : 0;
+  ctx.drawImage(c.canvas, tx - (pad + ax) * ksx, ty - pad * ksy, c.canvas.width * ksx, c.canvas.height * ksy);
+}
+const BASELINE_SHIFT = 1;  // calibration: multiples of font.margin (3px); tune if text still sits off vs the game
+function renderText(font, lines, align, colour) {
+  const lh = font.ascent + font.descent, pad = font.ascent, m = font.margin;
+  const adv = ch => font.glyphs[ch.codePointAt(0)]?.[0] ?? lh / 2;
+  const widths = lines.map(l => [...l].reduce((a, ch) => a + adv(ch), 0)), maxW = Math.max(0, ...widths);
+  const canvas = document.createElement('canvas'), tctx = canvas.getContext('2d');
+  canvas.width = Math.ceil(maxW + pad * 2); canvas.height = lines.length * lh + pad * 2;
+  lines.forEach((line, i) => {
+    let x = pad + (align === 'center' ? (maxW - widths[i]) / 2 : align === 'right' ? maxW - widths[i] : 0);
+    // baseline = line top + ascent + margin: ascent excludes the glyph padding (margin) the boxes carry
+    const base = pad + i * lh + font.ascent + BASELINE_SHIFT * m;
+    for (const ch of line) {
+      const g = font.glyphs[ch.codePointAt(0)];
+      if (g && g[1] !== 65535)
+        tctx.drawImage(font.pages[g[1]], g[4], g[5], g[6] - g[4], g[7] - g[5], x + g[2] - m, base - g[3] - m, g[6] - g[4], g[7] - g[5]);
+      x += adv(ch);
+    }
+  });
+  tctx.globalCompositeOperation = 'source-in';
+  tctx.fillStyle = colour;
+  tctx.fillRect(0, 0, canvas.width, canvas.height);
+  return { canvas, maxW };
+}
+
+const rgba = c => `rgba(${c[0] * 255},${c[1] * 255},${c[2] * 255},${c[3]})`;
+
+function drawData(n, s, col, depth, m) {
+  const d = n.data, w = s.w ?? 0, h = s.h ?? 0, x0 = -d.px, y0 = -d.py;
+  // blend = flags & 0xF (CIMG/CNUM 0x49, CSLI 0x80): 0 normal, 1 add, 2 subtract, 3 multiply (inferred from node names)
+  // ponytail: canvas has no subtract; 'difference' is the closest stand-in
+  ctx.globalCompositeOperation = BLEND[d.flags & 0xF] || 'source-over';
+  col = mul(col, s.vcol);
+  if (d.kind === 'CIMG') {
+    if (d.text) {
+      // alignment bits are guessed: 4 = h-centre, 16 = right, 2 = v-middle
+      const fname = proj.fonts[d.text.font] || '', font = fonts[fname];
+      const size = +fname.match(/(\d+)pt/)?.[1] || +n.attrs?.FontParamData?.pointY || 24;
+      const f = d.text.flags, lines = d.text.str.replace(/\r/g, '').replace(/\n$/, '').split('\n');
+      const align = f & 4 ? 'center' : f & 16 ? 'right' : 'left';
+      const [ksx, ksy] = d.text.scale, lh = (font ? font.ascent + font.descent : size * 1.2) * ksy;
+      const tx = f & 4 ? x0 + w / 2 : f & 16 ? x0 + w : x0;
+      const ty = f & 2 ? y0 + (h - lines.length * lh) / 2 : y0;
+      ctx.globalAlpha = Math.max(0, Math.min(1, col[3]));
+      if (font?.pages.every(p => p.complete && p.naturalWidth)) {
+        drawBitmapText(font, lines, tx, ty, align, ksx, ksy, col);
+      } else {  // font still unpacking / missing: system font
+        ctx.fillStyle = rgba([...col.slice(0, 3), 1]);
+        ctx.font = `${size}px "Noto Sans CJK JP", sans-serif`;
+        ctx.textAlign = align;
+        ctx.textBaseline = 'top';
+        lines.forEach((line, i) => {
+          ctx.save(); ctx.translate(tx, ty + i * lh); ctx.scale(ksx, ksy); ctx.fillText(line, 0, 0); ctx.restore();
+        });
+        ctx.textAlign = 'left';
+      }
+    } else if (d.crefs.length) {
+      drawCrop(cropOf(d.crefs[Math.min(s.crop, d.crefs.length - 1)] || d.crefs[0]), x0, y0, w, h, col, d.flags);
+    } else {  // no texture: solid colour quad
+      ctx.globalAlpha = Math.max(0, Math.min(1, col[3]));
+      ctx.fillStyle = rgba([...col.slice(0, 3), 1]);
+      ctx.fillRect(x0, y0, w, h);
+    }
+  } else if (d.kind === 'CSLI') {
+    // SLIC cell sizes: >0 = fixed pixels, 0 = stretch to fill the rest
+    const cellAt = (ci, ri) => d.cells[ri * d.cols + ci] || {};
+    const cell = (ci, ri) => cropOf(d.crefs[cellAt(ci, ri).cref ?? ri * d.cols + ci]);
+    const fill = (sizes, total) => {
+      const fixed = sizes.reduce((a, b) => a + b, 0), n = sizes.filter(v => !v).length;
+      return sizes.map(v => v || Math.max(0, total - fixed) / n);
+    };
+    const colW = [...Array(d.cols)].map((_, ci) => cellAt(ci, 0).w ?? 0);
+    const rowH = [...Array(d.rows)].map((_, ri) => cellAt(0, ri).h ?? 0);
+    const cw = fill(colW, w), rh = fill(rowH, h);
+    let yy = y0;
+    for (let ri = 0; ri < d.rows; ri++) {
+      let xx = x0;
+      for (let ci = 0; ci < d.cols; ci++) { drawCrop(cell(ci, ri), xx, yy, cw[ci], rh[ri], col, cellAt(ci, ri).flags); xx += cw[ci]; }
+      yy += rh[ri];
+    }
+  } else if (d.kind === 'CNUM') {
+    // ponytail: left-aligned, digit glyphs = crefs[0..9]; real alignment/padding flags unknown
+    const digits = String(Math.max(0, Math.round(s.value ?? 0)));
+    const adv = (d.digitW || w) + d.spacing;
+    [...digits].forEach((ch, i) => drawCrop(cropOf(d.crefs[+ch]), x0 + i * adv, y0, d.digitW || w, d.digitH || h, col));
+  } else if (d.kind === 'CRFD' && depth < 4) {
+    const sc = proj.scenes.find(x => x.name === d.scene) || scene;
+    const l = sc.layers.find(x => x.name === d.layer);
+    if (l) drawLayer(l, d.anim || animName, frame, col, depth + 1, m);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+let boxes = [];
+function drawLayer(layer, name, f, col, depth, base = ctx.getTransform()) {
+  const end = layer.anims.find(a => a.name === name)?.end ?? 0;
+  const st = nodeStates(layer, name, end > 0 ? f % (end + 1) : f);
+  // Nodes are composed as 3D matrices (DOMMatrix rotate applies X, then Y, then Z) and projected
+  // orthographically: the 2D part of the matrix is exactly that projection.
+  // ponytail: no perspective from the scene camera and no depth sorting; needs WebGL if those matter.
+  const visit = (i, parent, inherited) => {
+    for (; i >= 0 && i < layer.nodes.length; i = layer.nodes[i].sibling) {
+      const n = layer.nodes[i], s = st[i];
+      if (!s.display) continue;
+      const m = parent.translate(s.x, s.y, s.z).rotate(s.rx, s.ry, s.rot).scale(s.sx, s.sy, s.sz);
+      ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
+      // RGB tints only this node; alpha is inherited by children
+      const c = [...s.color.slice(0, 3), inherited[3] * s.color[3]];
+      if (n.data) {
+        drawData(n, s, c, depth, m);
+        if ($('showbox').checked || n === selNode)
+          boxes.push({ m: ctx.getTransform(), x: -n.data.px, y: -n.data.py, w: s.w, h: s.h, sel: n === selNode });
+      }
+      if (n.child >= 0) visit(n.child, m, [1, 1, 1, c[3]]);
+    }
+  };
+  for (const r of roots(layer.nodes)) visit(r, base, col);
+  ctx.setTransform(base);
+}
+
+let last = performance.now();
+function tick(now) {
+  if (playing && proj) setFrame(frame + (now - last) * 60 / 1000);
+  last = now;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (scene) {
+    if ($('showbg').checked) { ctx.fillStyle = rgba(parseColor(scene.bg)); ctx.fillRect(0, 0, cv.width, cv.height); }
+    boxes = [];
+    for (const li of [...visible].sort((a, b) => a - b)) {
+      const l = scene.layers[li];
+      // LAYR flag 0x1: origin at screen centre (inferred: these layers' roots sit at 0,0 with centred pivots)
+      ctx.setTransform(1, 0, 0, 1, l.flags & 1 ? scene.w / 2 : 0, l.flags & 1 ? scene.h / 2 : 0);
+      drawLayer(l, animName, frame, [1, 1, 1, 1], 0);
+    }
+    ctx.globalAlpha = 1;
+    for (const b of boxes) {
+      ctx.setTransform(b.m);
+      ctx.strokeStyle = b.sel ? '#ff0' : 'rgba(95,179,255,.6)';
+      ctx.lineWidth = (b.sel ? 3 : 1) / Math.hypot(b.m.a, b.m.b);
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+    }
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

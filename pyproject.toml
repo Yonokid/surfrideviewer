@@ -1,0 +1,8 @@
+[project]
+name = "surfrideviewer"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "amlibpy>=2025.10.5.post5",
+    "pillow>=13.0.0",
+]
