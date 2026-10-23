@@ -17,7 +17,9 @@
   #files div:hover, #tree div:hover { background: var(--line); }
   #files div.patched::after { content: ' ✎'; color: var(--dim); }
   #files div.sel, #tree div.sel { background: var(--acc); color: #000; }
-  #layers label { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #layers > div { display: flex; gap: 4px; align-items: center; }
+  #layers label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #layers select { padding: 0 2px; font-size: 11px; }
   main { display: flex; flex-direction: column; min-width: 0; }
   #stage { flex: 1; display: grid; place-items: center; overflow: hidden; min-height: 0; }
   canvas { background: repeating-conic-gradient(#2a2d34 0 25%, #22252b 0 50%) 0 0 / 32px 32px; box-shadow: 0 0 0 1px var(--line); }
@@ -53,6 +55,8 @@
   <div id="layers"></div>
   <h3>Animation</h3>
   <select id="anim"></select>
+  <label title="Applied at its last frame underneath the playing animation. The game keeps whatever earlier animations set, so e.g. a gauge animation normally runs after A_in has faded the layer in.">Base pose
+    <select id="baseAnim"></select></label>
   <label><input type="checkbox" id="showbg"> Scene background colour</label>
   <label><input type="checkbox" id="showbox"> Show bounding boxes</label>
 </aside>
@@ -137,7 +141,7 @@ async function load(path, keepView = false) {
   if (view) {  // patch toggled: keep the same view
     $('scene').value = view.scene;
     visible = view.visible;
-    $('layers').querySelectorAll('input').forEach((cb, li) => cb.checked = visible.has(li));
+    $('layers').querySelectorAll('input[type=checkbox]').forEach((cb, li) => cb.checked = visible.has(li));
     animName = view.animName; refreshAnims(); buildTree(); setFrame(view.frame);
   }
   select(view?.sel && scene.layers[view.sel[0]]?.nodes[view.sel[1]]);
@@ -208,6 +212,7 @@ const FIELDS = {
   text: { label: 'Text', get: n => n.data.text.str, set: (n, v) => n.data.text.str = v },
 };
 const TRACK_OF = { x: 0, y: 1, w: 11, h: 12 };
+let lockAspect = false;  // "Keep aspect ratio" in the editor; remembered across selections
 
 function selRef() {
   const li = scene?.layers.findIndex(l => l.nodes.includes(selNode));
@@ -241,6 +246,10 @@ function select(n) {
   const keys = Object.keys(FIELDS).filter(k => n.edit?.[k]);
   if (!keys.length) { ed.append(note('Nothing editable on this node.')); return; }
   if (locked) ed.append(note('Turn Apply on to edit.'));
+  // Keep aspect: editing Width/Height scales the other by the ratio they had when the lock was turned on
+  const inputs = {};
+  let ratio = n.data && n.data.w ? n.data.h / n.data.w : 0;
+  const linked = { w: ['h', v => v * ratio], h: ['w', v => v / ratio] };
   for (const k of keys) {
     const f = FIELDS[k], entry = patch?.list.find(e => e.path === n.edit[k]);
     const input = document.createElement(k === 'text' ? 'textarea' : 'input');
@@ -259,9 +268,22 @@ function select(n) {
         v = +input.value;
       }
       input.classList.toggle('changed', edit(n, k, v));
+      const [other, scale] = linked[k] || [];
+      if (other && lockAspect && ratio && inputs[other]) {
+        const ov = Math.round(scale(v) * 1000) / 1000;
+        inputs[other].value = ov;
+        inputs[other].classList.toggle('changed', edit(n, other, ov));
+      }
     };
+    inputs[k] = input;
     const lab = document.createElement('label'); lab.textContent = f.label;
     ed.append(lab, input);
+    if (k === 'h' && inputs.w) {
+      const lock = Object.assign(document.createElement('input'), { type: 'checkbox', checked: lockAspect, disabled: locked || !ratio });
+      lock.onchange = () => { lockAspect = lock.checked; ratio = n.data.w ? n.data.h / n.data.w : 0; };
+      const row = document.createElement('label'); row.className = 'note'; row.append(lock, ' Keep aspect ratio');
+      ed.append(row);
+    }
   }
   const li = scene.layers.findIndex(l => l.nodes.includes(n)), ci = scene.layers[li].nodes.indexOf(n);
   const anim = scene.layers[li].anims.find(a => a.name === animName);
@@ -286,12 +308,18 @@ function pickScene(i) {
   cv.width = scene.w; cv.height = scene.h; fit();
   visible = new Set(scene.layers.length ? [0] : []);
   $('layers').replaceChildren(...scene.layers.map((l, li) => {
-    const lab = document.createElement('label');
+    const row = document.createElement('div'), lab = document.createElement('label');
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = visible.has(li);
     cb.onchange = () => { cb.checked ? visible.add(li) : visible.delete(li); refreshAnims(); buildTree(); };
-    lab.append(cb, ' ' + l.name + ' ');
+    lab.append(cb, ' ' + l.name + ' '); lab.title = l.name;
     const s = document.createElement('span'); s.className = 'tag'; s.textContent = l.nodes.length; lab.append(s);
-    return lab;
+    const origin = document.createElement('select');
+    origin.title = 'Layer origin. Auto centres layers the game positions at runtime.';
+    origin.append(new Option(`Auto (${layerCentred(l) ? 'centre' : 'top-left'})`, 'auto'), new Option('Top-left', 'tl'), new Option('Centre', 'centre'));
+    origin.value = l.origin || 'auto';
+    origin.onchange = () => { l.origin = origin.value; };
+    row.append(lab, origin);
+    return row;
   }));
   refreshAnims(); buildTree();
 }
@@ -307,9 +335,21 @@ function refreshAnims() {
     animName = (all.find(a => a.motions.length) || all[0])?.name || '';
   }
   $('anim').value = animName;
+  $('baseAnim').replaceChildren(new Option('Auto (A_in…)', 'auto'), new Option('(none)', ''), ...[...names].map(n => new Option(n, n)));
+  $('baseAnim').value = baseAnim === 'auto' || names.has(baseAnim) ? baseAnim : 'auto';
   setFrame(0);
 }
 $('anim').onchange = e => { animName = e.target.value; setFrame(0); };
+let baseAnim = 'auto';
+$('baseAnim').onchange = e => { baseAnim = e.target.value; };
+
+// The base-pose animation for a layer: chosen by name, or 'auto' = its intro (A_in, else the first A_in…).
+function resolveBase(layer, name) {
+  const b = baseAnim === 'auto'
+    ? layer.anims.find(a => a.name === 'A_in') || layer.anims.find(a => /^A_in/i.test(a.name))
+    : layer.anims.find(a => a.name === baseAnim);
+  return b && b.name !== name ? b : null;
+}
 
 function maxEnd() {
   let m = 0;
@@ -344,6 +384,15 @@ function walk(nodes, start, depth, fn) {  // visit node, its children, then its 
   }
 }
 const BLEND = { 1: 'lighter', 2: 'difference', 3: 'multiply' };
+// ExtParamData blendMode (game-side shader), inferred as Photoshop's blend-mode order from node names
+// (3 C_chara_dmy, 8 clouds/lens flares/lights, 9 EXP_screen, 10 EXT_OverRay). Modes canvas lacks use the nearest one.
+// 20+ are shader effects (24/25 blur, 27 distortion, 20/21 covers), not blends: drawn normally.
+const EXT_BLEND = [
+  'source-over', 'source-over' /* dissolve */, 'darken', 'multiply', 'color-burn', 'multiply' /* linear burn */,
+  'darken' /* darker colour */, 'lighten', 'screen', 'color-dodge', 'lighter' /* linear dodge (add) */,
+  'lighten' /* lighter colour */, 'overlay', 'soft-light', 'hard-light', 'hard-light' /* vivid light */,
+  'hard-light' /* linear light */, 'hard-light' /* pin light */, 'hard-light' /* hard mix */, 'difference',
+];
 const KIND = { 0: '', 1: 'img', 2: 'slice', 3: 'ref', 4: 'num' };
 function buildTree() {
   const out = [];
@@ -389,18 +438,26 @@ const lerpColor = (a, b, s) => {
 const mul = (a, b) => a.map((v, i) => v * b[i]);
 
 // Apply animated tracks of the layer's current animation to a copy of each node's state.
-function nodeStates(layer, name, f) {
+function nodeStates(layer, name, f, base = resolveBase(layer, name)) {
   const st = layer.nodes.map(n => ({
     x: n.pos[0], y: n.pos[1], z: n.pos[2], rx: n.rot[0], ry: n.rot[1], rot: n.rot[2],
     sx: n.scale[0], sy: n.scale[1], sz: n.scale[2], display: n.display,
     color: parseColor(n.color), w: n.data?.w, h: n.data?.h, vcol: n.data?.vcol?.[0] ? parseColor(n.data.vcol[0]) : [1, 1, 1, 1],
     crop: 0, value: n.data?.value,
   }));
+  if (base) applyAnim(st, base, base.end);  // tracks of the playing animation override it below
   const anim = layer.anims.find(a => a.name === name);
-  if (!anim) return st;
+  if (anim) applyAnim(st, anim, f);
+  return st;
+}
+
+function applyAnim(st, anim, f) {
   for (const m of anim.motions) {
     const s = st[m.cast]; if (!s) continue;
-    for (const t of m.tracks) {
+    // alpha (21) wins over a colour track's alpha whatever the track order, e.g. A_in_00
+    // C_aime_cabinet_pic_01: colour #FFFFFFFF from frame 0, alpha 0 until frame 130
+    const tracks = [...m.tracks].sort((a, b) => (a.type === 21) - (b.type === 21));
+    for (const t of tracks) {
       const v = evalTrack(t.keys, f); if (v === undefined) continue;
       switch (t.type) {
         case 0: s.x = v; break;
@@ -423,7 +480,6 @@ function nodeStates(layer, name, f) {
       }
     }
   }
-  return st;
 }
 
 // ---------- drawing ----------
@@ -505,20 +561,24 @@ function renderText(font, lines, align, colour) {
 const rgba = c => `rgba(${c[0] * 255},${c[1] * 255},${c[2] * 255},${c[3]})`;
 
 function drawData(n, s, col, depth, m) {
-  const d = n.data, w = s.w ?? 0, h = s.h ?? 0, x0 = -d.px, y0 = -d.py;
-  // blend = flags & 0xF (CIMG/CNUM 0x49, CSLI 0x80): 0 normal, 1 add, 2 subtract, 3 multiply (inferred from node names)
+  const d = n.data, w = s.w ?? 0, h = s.h ?? 0, [x0, y0] = pivot(n, s).map(v => -v);
+  // blend = flags & 0xF (CIMG/CNUM 0x49, CSLI 0x80): 0 normal, 1 add, 2 subtract, 3 multiply (inferred from node names);
+  // a non-zero ExtParamData blendMode overrides it (e.g. C_cloud_00: flags multiply, ext 8 screen)
   // ponytail: canvas has no subtract; 'difference' is the closest stand-in
-  ctx.globalCompositeOperation = BLEND[d.flags & 0xF] || 'source-over';
+  const ext = +(n.attrs?.ExtParamData?.blendMode || 0);
+  ctx.globalCompositeOperation = (ext > 0 && EXT_BLEND[ext]) || BLEND[d.flags & 0xF] || 'source-over';
   col = mul(col, s.vcol);
   if (d.kind === 'CIMG') {
     if (d.text) {
-      // alignment bits are guessed: 4 = h-centre, 16 = right, 2 = v-middle
+      // 8 = right (pivot sits at the right edge: T_value, T_segacorp), 4 = h-centre (pivot at w/2),
+      // 2 = v-middle (guess). 16 is not alignment: L_TestMode_top_menu items (19) are a left-aligned
+      // column at x=860 that sits around screen centre.
       const fname = proj.fonts[d.text.font] || '', font = fonts[fname];
       const size = +fname.match(/(\d+)pt/)?.[1] || +n.attrs?.FontParamData?.pointY || 24;
       const f = d.text.flags, lines = d.text.str.replace(/\r/g, '').replace(/\n$/, '').split('\n');
-      const align = f & 4 ? 'center' : f & 16 ? 'right' : 'left';
+      const align = f & 8 ? 'right' : f & 4 ? 'center' : 'left';
       const [ksx, ksy] = d.text.scale, lh = (font ? font.ascent + font.descent : size * 1.2) * ksy;
-      const tx = f & 4 ? x0 + w / 2 : f & 16 ? x0 + w : x0;
+      const tx = x0 + (align === 'center' ? w / 2 : align === 'right' ? w : 0);
       const ty = f & 2 ? y0 + (h - lines.length * lh) / 2 : y0;
       ctx.globalAlpha = Math.max(0, Math.min(1, col[3]));
       if (font?.pages.every(p => p.complete && p.naturalWidth)) {
@@ -570,6 +630,38 @@ function drawData(n, s, col, depth, m) {
   ctx.globalCompositeOperation = 'source-over';
 }
 
+// Should the layer's origin be the screen centre? LAYR flag 0x1 says so explicitly. Otherwise guess: layers
+// the game places at runtime are authored around (0,0), so if the base-pose content is centred nearer (0,0)
+// than the screen centre, centre it. ponytail: heuristic; the per-layer Origin dropdown overrides it.
+// Angles are Y-up (positive Z = counter-clockwise on screen, e.g. the Aime card in L_Entry_aime);
+// in this Y-down space that negates the X and Z rotations.
+// The pivot is stored in pixels of the node's own size, and keeps that ratio when width/height
+// tracks animate it (e.g. L_Entry_code/C_code_box: 210 → 540 tall stays centred).
+const pivot = (n, s) => [n.data.px * (n.data.w ? (s.w ?? n.data.w) / n.data.w : 1),
+                         n.data.py * (n.data.h ? (s.h ?? n.data.h) / n.data.h : 1)];
+const nodeMatrix = (parent, s) => parent.translate(s.x, s.y, s.z).rotate(-s.rx, s.ry, -s.rot).scale(s.sx, s.sy, s.sz);
+
+function layerCentred(layer) {
+  if (layer.flags & 1) return true;
+  if (layer._centred !== undefined) return layer._centred;
+  const st = nodeStates(layer, '', 0, null);  // resting pose, no base animation
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const visit = (i, parent) => {
+    for (; i >= 0 && i < layer.nodes.length; i = layer.nodes[i].sibling) {
+      const n = layer.nodes[i], s = st[i];
+      const m = nodeMatrix(parent, s);
+      if (n.data) for (const [px, py] of [[0, 0], [s.w || 0, 0], [0, s.h || 0], [s.w || 0, s.h || 0]]) {
+        const [ox, oy] = pivot(n, s), p = m.transformPoint({ x: px - ox, y: py - oy });
+        x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+      }
+      if (n.child >= 0) visit(n.child, m);
+    }
+  };
+  for (const r of roots(layer.nodes)) visit(r, new DOMMatrix());
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  return layer._centred = isFinite(cx) && Math.hypot(cx, cy) < Math.hypot(cx - scene.w / 2, cy - scene.h / 2);
+}
+
 let boxes = [];
 function drawLayer(layer, name, f, col, depth, base = ctx.getTransform()) {
   const end = layer.anims.find(a => a.name === name)?.end ?? 0;
@@ -581,16 +673,16 @@ function drawLayer(layer, name, f, col, depth, base = ctx.getTransform()) {
     for (; i >= 0 && i < layer.nodes.length; i = layer.nodes[i].sibling) {
       const n = layer.nodes[i], s = st[i];
       if (!s.display) continue;
-      const m = parent.translate(s.x, s.y, s.z).rotate(s.rx, s.ry, s.rot).scale(s.sx, s.sy, s.sz);
+      const m = nodeMatrix(parent, s);
       ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
-      // RGB tints only this node; alpha is inherited by children
-      const c = [...s.color.slice(0, 3), inherited[3] * s.color[3]];
+      // colour (RGB and alpha) multiplies down to children, e.g. black C_error_*_txt parents make white text black
+      const c = inherited.map((v, k) => v * s.color[k]);
       if (n.data) {
         drawData(n, s, c, depth, m);
         if ($('showbox').checked || n === selNode)
-          boxes.push({ m: ctx.getTransform(), x: -n.data.px, y: -n.data.py, w: s.w, h: s.h, sel: n === selNode });
+          boxes.push({ m: ctx.getTransform(), x: -pivot(n, s)[0], y: -pivot(n, s)[1], w: s.w, h: s.h, sel: n === selNode });
       }
-      if (n.child >= 0) visit(n.child, m, [1, 1, 1, c[3]]);
+      if (n.child >= 0) visit(n.child, m, c);
     }
   };
   for (const r of roots(layer.nodes)) visit(r, base, col);
@@ -609,8 +701,8 @@ function tick(now) {
     boxes = [];
     for (const li of [...visible].sort((a, b) => a - b)) {
       const l = scene.layers[li];
-      // LAYR flag 0x1: origin at screen centre (inferred: these layers' roots sit at 0,0 with centred pivots)
-      ctx.setTransform(1, 0, 0, 1, l.flags & 1 ? scene.w / 2 : 0, l.flags & 1 ? scene.h / 2 : 0);
+      const c = l.origin === 'centre' || (l.origin !== 'tl' && layerCentred(l));
+      ctx.setTransform(1, 0, 0, 1, c ? scene.w / 2 : 0, c ? scene.h / 2 : 0);
       drawLayer(l, animName, frame, [1, 1, 1, 1], 0);
     }
     ctx.globalAlpha = 1;

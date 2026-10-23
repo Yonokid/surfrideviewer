@@ -19,10 +19,11 @@ Open http://localhost:8765. Pick a file, scene, layers and animation. **Patch �
 
 - Node type = `NODE.0x30 & 0xF`: 0 null, 1 image (`CIMG`), 2 9-slice (`CSLI`), 3 layer reference (`CRFD`), 4 number (`CNUM`).
 - Tree: `NODE.0x3C` first child, `0x3D` next sibling. Origin top-left, Y down.
-- `TRS2`: `0x34` pos, `0x35` rotation (0x10000 = 360°), `0x36` scale, `0x3B` display, `0x3A` colour. Children inherit alpha only.
+- `TRS2`: `0x34` pos, `0x35` rotation (0x10000 = 360°, positive = counter-clockwise on screen), `0x36` scale, `0x3B` display, `0x3A` colour. Colour (RGB and alpha) multiplies down to children and referenced layers.
 - Image flags (`CIMG`/`CNUM` `0x49`, `CSLI` `0x80`, SLIC cell `0x83`): low nibble = blend (0 normal, 1 add, 2 subtract, 3 multiply), `0x10` flip X, `0x20` flip Y.
+- `CATR` `ExtParamData.blendMode` (game shader, overrides the above when non-zero): 1–19 look like Photoshop blend-mode order (3 multiply, 8 screen, 9 colour dodge, 10 add, 19 difference); 20+ are effects (24/25 blur, 27 distortion), drawn normally.
 - `LAYR.0x20` bit `0x1`: layer origin at screen centre.
-- `CREF.0x4A` = `[texture index, crop index]`; pivot `0x42/0x43` is in pixels.
+- `CREF.0x4A` = `[texture index, crop index]`; pivot `0x42/0x43` is in pixels of the node's own size and keeps its ratio when width/height tracks (11/12) animate the size.
 - Track types: 0/1 pos X/Y, 5 rot Z, 6/7 scale X/Y, 9 colour, 10 display, 11/12 width/height, 13–16 vertex colours, 17 crop index, 21 alpha.
 
 ## RFZ fonts
@@ -31,4 +32,4 @@ Open http://localhost:8765. Pick a file, scene, layers and animation. **Patch �
 
 ## Not handled
 
-Masks/stencils, per-vertex gradients (top-left colour only), subtract blending (drawn as `difference`), perspective/depth sorting for TRS3 layers, `CNUM` alignment flags. Text alignment bits are guessed.
+Masks/stencils, per-vertex gradients (top-left colour only), subtract blending (drawn as `difference`), perspective/depth sorting for TRS3 layers, `CNUM` alignment flags. Text flags (`TEXT.0x78`): `0x8` right, `0x4` centre (inferred from pivots), `0x10` not alignment (meaning unknown); vertical bits are guessed.
