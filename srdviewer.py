@@ -3,16 +3,6 @@
 Usage: uv run srdviewer.py <surfboard dir> [--port N] [--translation DIR]
 e.g.   uv run srdviewer.py "/path/to/CHUNITHM/App/data/surfboard" \
            --translation ~/Documents/GitHub/chutranslation/SDHD_24000
-
-chutranslation-style JSON patches (a list of {path, value, original}) can be imported per
-file in the web UI; they are POSTed with the request and applied in memory only.
---translation loads DIR/src/srd/<path>.json patches and DIR/src/texture/*.dds textures
-(as build.py uses them); saving in the web UI writes the patch JSON back to DIR/src/srd.
-
-Parses .srd (VTBF) files with amlibpy's generic VTC reader, simplifies them into
-JSON and serves them, along with DDS textures converted to PNG, to index.html.
-.rfz bitmap fonts (from <surfboard dir>/../*/font) are unpacked with rfz_unpack.py
-into .cache/fonts/ on first run.
 """
 
 import argparse
@@ -21,7 +11,7 @@ import json
 import re
 import sys
 from concurrent.futures import ProcessPoolExecutor
-from functools import lru_cache
+from functools import cache, lru_cache
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -29,9 +19,8 @@ from urllib.parse import parse_qs, urlparse
 from amlibpy.surf.vtbf import KNOWN_VTC, VTBF_Reader
 from PIL import Image
 
-import rfz_unpack
+from rfz import unpack_font
 
-# amlibpy's typed SurfRide classes assert on a lot of CHUNITHM files; use the raw tree.
 KNOWN_VTC.clear()
 
 HERE = Path(__file__).parent
@@ -85,7 +74,7 @@ def groups(n):
 
 
 def annotate(n, path):
-    """Store each VTC's JSONPath (as used by chutranslation patches) on it as _path."""
+    """Store each VTC's JSONPath on it as _path."""
     n._path = path
     for i, c in enumerate(n.children):
         annotate(c, f"{path}.children[{i}]")
@@ -185,7 +174,7 @@ def conv_cast(c):
             pos, rot, scl = [*t.get(0x34, [0, 0]), 0], [0, 0, angle(t.get(0x35, 0))], [*t.get(0x36, [1, 1]), 1]
         else:
             pos, rot, scl = t.get(0x37, [0, 0, 0]), [angle(a) for a in t.get(0x38, [0, 0, 0])], t.get(0x39, [1, 1, 1])
-        # JSONPaths of the user-editable values, for building patches
+
         edit = {}
         pp = prop_path(trs2 or trs3, 0, tidx[i].get(0x34 if trs2 else 0x37)) if i < len(tidx) else None
         if pp:
@@ -212,6 +201,8 @@ def conv_cast(c):
 def conv_track(t):
     p = props(t)
     k = kid(t, "KEY ")
+    if k is None:
+        return
     frames = multi(k, 0x5A)
     vals = multi(k, 0x5B)
     interp = multi(k, 0x5C) or [1] * len(frames)  # colour keys carry no interpolation: lerp them
@@ -229,7 +220,7 @@ def conv_anim(a):
     p = props(a)
     motions = kids(a, "MOT ")
     end = p.get(0x56, 0)
-    if end < 0:  # CHUNITHM stores -1; use the last track frame instead
+    if end < 0:
         end = max((props(t).get(0x59, 0) for m in motions for t in kids(m, "TRK ")), default=0)
     return {
         "name": p.get(0x03, ""),
@@ -252,9 +243,6 @@ def conv_layer(l):
 
 
 def apply_patches(vtbf, patches):
-    """Apply chutranslation patches ($.children[i]...properties[j].value) to the loaded tree, in memory.
-    Returns the patches that failed (bad path, or `original` doesn't match, e.g. another game version);
-    those are skipped."""
     get = lambda o, k: o[k] if isinstance(k, int) else getattr(o, k)
     bad = []
     for p in patches:
@@ -309,7 +297,7 @@ def convert(path, patches=None):
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
-        super().__init__(*a, directory=str(HERE), **kw)
+        super().__init__(*a, directory=str(HERE / "web"), **kw)
 
     def send_bytes(self, body, ctype, status=200):
         self.send_response(status)
@@ -348,7 +336,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if png is None:
                     return self.send_bytes(b"not found", "text/plain", 404)
                 return self.send_bytes(png, "image/png")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return self.send_bytes(f"{type(e).__name__}: {e}".encode(), "text/plain", 500)
         super().do_GET()
 
@@ -363,7 +351,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(patches, list):
                 return self.send_bytes(b"patch must be a JSON list", "text/plain", 400)
             return self.send_srd(parse_qs(url.query), patches)
-        except Exception as e:
+        except Exception as e: # noqa: BLE001
             return self.send_bytes(f"{type(e).__name__}: {e}".encode(), "text/plain", 500)
 
     def do_PUT(self):
@@ -379,7 +367,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_bytes(b"patch must be a JSON list", "text/plain", 400)
             save_patch(pf, patches)
             return self.send_bytes(b"saved", "text/plain")
-        except Exception as e:
+        except Exception as e: # noqa: BLE001
             return self.send_bytes(f"{type(e).__name__}: {e}".encode(), "text/plain", 500)
 
     def send_srd(self, q, patches=None):
@@ -389,13 +377,12 @@ class Handler(SimpleHTTPRequestHandler):
         return self.send_bytes(json.dumps(convert(path, patches)).encode(), "application/json")
 
 
-@lru_cache(maxsize=None)
+@cache
 def dds_index():
     return {p.stem.lower(): p for p in ROOT.rglob("*.dds")}
 
 
 def patch_file(rel):
-    """Translation patch path for a surfboard-relative .srd path (None without --translation or if invalid)."""
     if not TL_SRD or not rel.endswith(".srd") or not (ROOT / rel).is_file():
         return None
     pf = (TL_SRD / rel).with_suffix(".json")
@@ -403,8 +390,6 @@ def patch_file(rel):
 
 
 def save_patch(pf, patches):
-    """Write in the repo's format (json.dump indent=2, ensure_ascii=False, no trailing newline).
-    JS sends whole floats as ints (-22 vs -22.0); every numeric field the editor writes is a Float, so restore that."""
     for e in patches:
         for k in ("value", "original"):
             if type(e.get(k)) is int:
@@ -417,7 +402,6 @@ def save_patch(pf, patches):
 
 @lru_cache(maxsize=512)
 def texture_png(name, translated=False):
-    """PNG of a texture by name; translated=True prefers the --translation src/texture copy (like build.py)."""
     tl = TL_TEX / f"{Path(name).stem}.dds" if translated and TL_TEX else None
     path = tl if tl and tl.is_file() else dds_index().get(Path(name).stem.lower())
     if path is None:
@@ -427,27 +411,11 @@ def texture_png(name, translated=False):
     return buf.getvalue()
 
 
-def unpack_font(rfz, out):
-    """Unpack an .rfz into out/font.json + out/page<N>.png. Pure-Python LZW: ~40s for a 24pt font."""
-    if (out / "font.json").exists():
-        return
-    d, _ = rfz_unpack.decompress_rfz(rfz.read_bytes())
-    meta, glyph_off = rfz_unpack.parse_metadata(d)
-    glyphs = rfz_unpack.parse_glyphs(d, glyph_off, meta["glyph_cnt"])
-    out.mkdir(parents=True, exist_ok=True)
-    for i, (_, _, _, dds) in enumerate(rfz_unpack.extract_textures(d)):
-        Image.open(io.BytesIO(dds)).save(out / f"page{i}.png")
-    keys = ("cell_inc_x", "page", "origin_x", "origin_y", "box_x1", "box_y1", "box_x2", "box_y2")
-    font = {"ascent": meta["max_ascent"], "descent": meta["max_descent"], "margin": meta["glyph_margin"],
-            "glyphs": {g["code"]: [g[k] for k in keys] for g in glyphs}}
-    (out / "font.json").write_text(json.dumps(font))  # written last: marks the cache entry complete
-
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("surfboard", type=Path)
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--translation", type=Path, help="chutranslation version dir, e.g. chutranslation/SDHD_24000")
+    ap.add_argument("--translation", type=Path, help="version dir, e.g. chutranslation/SDHD_24000")
     args = ap.parse_args()
     ROOT, port = args.surfboard, args.port
     if args.translation:

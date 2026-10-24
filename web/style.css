@@ -1,0 +1,29 @@
+:root { --bg: #1b1d22; --panel: #24272e; --line: #353943; --fg: #d8dbe2; --dim: #8a909c; --acc: #5fb3ff; }
+* { box-sizing: border-box; }
+body { margin: 0; height: 100vh; display: grid; grid-template-columns: 280px 1fr 300px; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; }
+aside { background: var(--panel); border-right: 1px solid var(--line); overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+aside:last-child { border-right: 0; border-left: 1px solid var(--line); }
+h3 { margin: 8px 0 2px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+input, select, button { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit; }
+button { cursor: pointer; }
+#files { flex: 1; min-height: 120px; overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
+#files div, #tree div { padding: 2px 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#files div:hover, #tree div:hover { background: var(--line); }
+#files div.patched::after { content: ' ✎'; color: var(--dim); }
+#files div.sel, #tree div.sel { background: var(--acc); color: #000; }
+#layers > div { display: flex; gap: 4px; align-items: center; }
+#layers label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#layers select { padding: 0 2px; font-size: 11px; }
+main { display: flex; flex-direction: column; min-width: 0; }
+#stage { flex: 1; display: grid; place-items: center; overflow: hidden; min-height: 0; }
+canvas { background: repeating-conic-gradient(#2a2d34 0 25%, #22252b 0 50%) 0 0 / 32px 32px; box-shadow: 0 0 0 1px var(--line); }
+#bar { display: flex; gap: 8px; align-items: center; padding: 8px; border-top: 1px solid var(--line); background: var(--panel); }
+#bar input[type=range] { flex: 1; }
+#status { color: var(--dim); padding: 0 8px 6px; background: var(--panel); min-height: 1.4em; }
+#editor { display: grid; grid-template-columns: auto 1fr; gap: 4px 6px; align-items: center; }
+#editor input, #editor textarea { width: 100%; min-width: 0; }
+#editor textarea { min-height: 4.5em; resize: vertical; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+#editor .changed { border-color: var(--acc); }
+#editor .note { grid-column: 1 / -1; color: var(--dim); font-size: 11px; }
+#info { white-space: pre-wrap; font: 11px ui-monospace, monospace; color: var(--dim); }
+.tag { color: var(--dim); font-size: 11px; }
