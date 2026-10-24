@@ -19,5 +19,5 @@ export const state = {
 export const images = {}; // texKey(name) -> HTMLImageElement
 export const fonts = {}; // .rfz name -> null while unpacking, then {ascent, descent, margin, glyphs, pages}
 export const patches = new Map(); // .srd path -> {name, list, dirty}: imported/loaded patches incl. unsaved edits
-export const useTlTex = () => server.textures && $("tltex").checked;
+export const useTlTex = () => state.server.textures && $("tltex").checked;
 export const texKey = (name) => (useTlTex() ? "tl:" : "") + name;

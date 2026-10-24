@@ -1,4 +1,4 @@
-import { $, images, patches, state, texKey, useTlTex } from "./state.js";
+import { $, fonts, images, patches, state, texKey, useTlTex } from "./state.js";
 import { buildTree, selRef, select } from "./editor.js";
 import { pickScene, refreshAnims, setFrame } from "./scene.js";
 
