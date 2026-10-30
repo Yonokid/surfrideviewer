@@ -279,10 +279,15 @@ export function drawData(n, s, col, depth, m) {
     ctx.globalCompositeOperation = "source-over";
 }
 
-export const pivot = (n, s) => [
-    n.data.px * (n.data.w ? (s.w ?? n.data.w) / n.data.w : 1),
-    n.data.py * (n.data.h ? (s.h ?? n.data.h) / n.data.h : 1),
-];
+// anchor 0-8: pivot at a 3x3 grid point of the current size (the game ignores px/py), 9: custom px/py
+export const pivot = (n, s) => {
+    const d = n.data,
+        a = d.anchor ?? 9,
+        w = s.w ?? d.w,
+        h = s.h ?? d.h;
+    if (a < 9) return [((a % 3) / 2) * w, (Math.floor(a / 3) / 2) * h];
+    return [d.px * (d.w ? w / d.w : 1), d.py * (d.h ? h / d.h : 1)];
+};
 export const nodeMatrix = (parent, s) =>
     parent
         .translate(s.x, s.y, s.z)

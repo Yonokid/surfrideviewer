@@ -125,6 +125,7 @@ def conv_data(d):
         "h": p.get(0x41, 0),
         "px": p.get(0x42, 0),
         "py": p.get(0x43, 0),
+        "anchor": p.get(0x4B, 9),  # 0-8 = 3x3 grid (game derives pivot from w/h), 9 = custom px/py
         "flags": p.get(0x80 if d.type == "CSLI" else 0x49, 0),  # low nibble = blend mode, 0x10/0x20 = flip
         "vcol": multi(d, 0x44)[:4],
         "crefs": crefs(d),
